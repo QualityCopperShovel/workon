@@ -1,8 +1,26 @@
 #!/bin/bash
 
-# newproject - SSH to bigbox-nitro, create a new project with standard infrastructure, and start claude
+# newproject - SSH to server, create a new project with standard infrastructure, and start claude
 
 set -e
+
+# Read SSH host from config file
+if [ ! -f ~/.workon_host ]; then
+    echo "Error: ~/.workon_host not found"
+    echo ""
+    echo "1. Add your server to ~/.ssh/config:"
+    echo ""
+    echo "   Host myserver"
+    echo "       HostName your.server.com"
+    echo "       User your-username"
+    echo "       IdentityFile ~/.ssh/your-key"
+    echo ""
+    echo "2. Create ~/.workon_host with that host name:"
+    echo ""
+    echo "   echo 'myserver' > ~/.workon_host"
+    exit 1
+fi
+SSH_HOST=$(cat ~/.workon_host | tr -d '[:space:]')
 
 if [ -z "$1" ]; then
     echo "Usage: newproject <project_name>"
@@ -29,7 +47,7 @@ fi
 echo -ne "\033]0;${PROJECT_NAME}\007"
 
 # SSH and run remote commands
-ssh -t bigbox-nitro bash -c "'
+ssh -t "$SSH_HOST" bash -c "'
     set -e
 
     # Load nvm to get the correct node/claude
