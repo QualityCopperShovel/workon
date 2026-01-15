@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# newproject - SSH to bigbox-nitro, create a new project with standard infrastructure, and start claude
+
+set -e
+
+if [ -z "$1" ]; then
+    echo "Usage: newproject <project_name>"
+    echo "Example: newproject myapp"
+    echo ""
+    echo "Creates a new project with standard infrastructure:"
+    echo "  - App user: app_<name>"
+    echo "  - Code directory: ~/apps/<name>/"
+    echo "  - Data directory: /home/app_<name>/data/"
+    echo "  - VERSION file initialized to 1.0.0"
+    exit 1
+fi
+
+PROJECT_NAME="$1"
+
+# Validate project name (lowercase, alphanumeric, underscores, hyphens)
+if [[ ! "$PROJECT_NAME" =~ ^[a-z0-9_-]+$ ]]; then
+    echo "Error: Project name must be lowercase alphanumeric with underscores/hyphens only"
+    echo "Got: $PROJECT_NAME"
+    exit 1
+fi
+
+# Set iTerm2 tab title
+echo -ne "\033]0;${PROJECT_NAME}\007"
+
+# SSH and run remote commands
+ssh -t bigbox-nitro bash -c "'
+    set -e
+
+    # Load nvm to get the correct node/claude
+    export NVM_DIR=\"\$HOME/.nvm\"
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+
+    PROJECT_NAME=\"$PROJECT_NAME\"
+    PROJECT_DIR=\"\$HOME/apps/\$PROJECT_NAME\"
+    APP_USER=\"app_\$PROJECT_NAME\"
+
+    # Check if project already exists
+    if [ -d \"\$PROJECT_DIR\" ]; then
+        echo \"Error: Project directory already exists: \$PROJECT_DIR\"
+        echo \"Use workon to open an existing project.\"
+        exit 1
+    fi
+
+    echo \"Creating new project: \$PROJECT_NAME\"
+    echo \"========================================\"
+
+    # 1. Create app user (for runtime isolation)
+    if id \"\$APP_USER\" &>/dev/null; then
+        echo \"App user \$APP_USER already exists\"
+    else
+        echo \"Creating app user: \$APP_USER\"
+        sudo useradd -m -s /bin/false \"\$APP_USER\"
+    fi
+
+    # 2. Create data directory
+    DATA_DIR=\"/home/\$APP_USER/data\"
+    if [ ! -d \"\$DATA_DIR\" ]; then
+        echo \"Creating data directory: \$DATA_DIR\"
+        sudo -u \"\$APP_USER\" mkdir -p \"\$DATA_DIR\"
+    fi
+
+    # 3. Create code directory
+    echo \"Creating code directory: \$PROJECT_DIR\"
+    mkdir -p \"\$PROJECT_DIR\"
+
+    # 4. Initialize VERSION file
+    echo \"1.0.0\" > \"\$PROJECT_DIR/VERSION\"
+    echo \"Initialized VERSION to 1.0.0\"
+
+    echo \"========================================\"
+    echo \"Project created successfully!\"
+    echo \"  Code: \$PROJECT_DIR\"
+    echo \"  Data: \$DATA_DIR\"
+    echo \"  User: \$APP_USER\"
+    echo \"========================================\"
+    echo \"\"
+    echo \"Starting Claude session...\"
+
+    # Update iTerm2 tab title
+    echo -ne \"\\033]0;\${PROJECT_NAME}\\007\"
+
+    # Create tmux session and launch claude
+    SESSION_NAME=\"\$PROJECT_NAME\"
+
+    if tmux has-session -t \"\$SESSION_NAME\" 2>/dev/null; then
+        echo \"Attaching to existing tmux session: \$SESSION_NAME\"
+        tmux attach-session -t \"\$SESSION_NAME\"
+    else
+        echo \"Creating new tmux session: \$SESSION_NAME\"
+        tmux new-session -s \"\$SESSION_NAME\" -c \"\$PROJECT_DIR\" \"cd \$PROJECT_DIR && claude --dangerously-skip-permissions\"
+    fi
+'"

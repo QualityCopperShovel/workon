@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# workon - SSH to bigbox-nitro and open/resume a tmux session for a project
+
+set -e
+
+# Read SSH host from config file
+if [ ! -f ~/.workon_host ]; then
+    echo "Error: ~/.workon_host not found"
+    echo ""
+    echo "1. Add your server to ~/.ssh/config:"
+    echo ""
+    echo "   Host myserver"
+    echo "       HostName your.server.com"
+    echo "       User your-username"
+    echo "       IdentityFile ~/.ssh/your-key"
+    echo ""
+    echo "2. Create ~/.workon_host with that host name:"
+    echo ""
+    echo "   echo 'myserver' > ~/.workon_host"
+    exit 1
+fi
+SSH_HOST=$(cat ~/.workon_host | tr -d '[:space:]')
+
+if [ -z "$1" ]; then
+    echo "Usage: workon <project_name_pattern> [session_number]"
+    echo "Example: workon myapp"
+    echo "Example: workon myapp 2  (for a second session)"
+    echo "Example: workon foo bar 2  (project 'foo bar', session 2)"
+    exit 1
+fi
+
+# Check if the last argument is a positive integer (session number)
+LAST_ARG="${@: -1}"
+if [[ "$LAST_ARG" =~ ^[0-9]+$ ]] && [ "$#" -gt 1 ]; then
+    # Last arg is a number and we have more than one arg - it's the session number
+    SESSION_NUM="$LAST_ARG"
+    # Pattern is everything except the last argument
+    PATTERN="${*:1:$#-1}"
+else
+    # No session number, entire input is the pattern
+    PATTERN="$*"
+    SESSION_NUM=""
+fi
+
+# Build tab title (pattern + optional number)
+if [ -n "$SESSION_NUM" ]; then
+    TAB_TITLE="${PATTERN} ${SESSION_NUM}"
+else
+    TAB_TITLE="${PATTERN}"
+fi
+
+# Set iTerm2 tab title locally before SSH
+echo -ne "\033]0;${TAB_TITLE}\007"
+
+# SSH and run remote commands
+ssh -t "$SSH_HOST" bash -c "'
+    # Load nvm to get the correct node/claude
+    export NVM_DIR=\"\$HOME/.nvm\"
+    [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
+
+    # Find matching directory in ~/apps
+    MATCHES=\$(ls ~/apps 2>/dev/null | grep -i \"$PATTERN\" || true)
+
+    if [ -z \"\$MATCHES\" ]; then
+        echo \"Error: No directory matching '\"$PATTERN\"' found in ~/apps\"
+        echo \"Available directories:\"
+        ls ~/apps
+        exit 1
+    fi
+
+    # Get first match
+    PROJECT=\$(echo \"\$MATCHES\" | head -n1)
+    PROJECT_DIR=\"\$HOME/apps/\$PROJECT\"
+
+    # Build session name (project + optional number)
+    SESSION_NUM=\"$SESSION_NUM\"
+    if [ -n \"\$SESSION_NUM\" ]; then
+        SESSION_NAME=\"\${PROJECT} \${SESSION_NUM}\"
+    else
+        SESSION_NAME=\"\$PROJECT\"
+    fi
+
+    echo \"Found project: \$PROJECT\"
+
+    # Update iTerm2 tab title with actual session name
+    echo -ne \"\\033]0;\${SESSION_NAME}\\007\"
+
+    # Check if tmux session exists
+    if tmux has-session -t \"\$SESSION_NAME\" 2>/dev/null; then
+        echo \"Attaching to existing tmux session: \$SESSION_NAME\"
+
+        # Check if claude is running in the session
+        CLAUDE_RUNNING=\$(tmux list-panes -t \"\$SESSION_NAME\" -F \"#{pane_current_command}\" 2>/dev/null | grep -c \"claude\" || true)
+
+        if [ \"\$CLAUDE_RUNNING\" -eq 0 ]; then
+            # Get current pane directory, if not in project dir, cd there first
+            CURRENT_DIR=\$(tmux display-message -t \"\$SESSION_NAME\" -p \"#{pane_current_path}\" 2>/dev/null || echo \"\")
+
+            if [ \"\$CURRENT_DIR\" != \"\$PROJECT_DIR\" ]; then
+                tmux send-keys -t \"\$SESSION_NAME\" \"cd \$PROJECT_DIR && claude --dangerously-skip-permissions\" Enter
+            else
+                tmux send-keys -t \"\$SESSION_NAME\" \"claude --dangerously-skip-permissions\" Enter
+            fi
+        fi
+
+        tmux attach-session -t \"\$SESSION_NAME\"
+    else
+        echo \"Creating new tmux session: \$SESSION_NAME\"
+        # Create new session, start in project dir, and launch claude
+        tmux new-session -s \"\$SESSION_NAME\" -c \"\$PROJECT_DIR\" \"cd \$PROJECT_DIR && claude --dangerously-skip-permissions\"
+    fi
+'"
