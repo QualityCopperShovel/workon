@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# workon - SSH to bigbox-nitro and open/resume a tmux session for a project
+# workon - SSH to server and open/resume a tmux session for a project
 
 set -e
 
