@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # workon - SSH to server and open/resume a tmux session for a project
-# Tries servers in order from ~/.workon_hosts until the project is found
+# Discovers tagged EC2 servers and searches them for the requested project.
 
 set -e
 
