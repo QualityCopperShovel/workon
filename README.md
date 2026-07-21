@@ -12,6 +12,14 @@ claudel myproject
 
 The scripts discover running EC2 instances tagged `Workon=true`, find the requested project under `~/apps` on those servers, and connect to the best match over SSH. The coding client runs on the VPS, not on your local computer.
 
+## AoSaaS and Platform 2040
+
+`workon` is designed as the agent bridge in the [AoSaaS (Agent-Oriented Software as a Service)](https://aosaas.com/) approach: start from a laptop, connect a coding agent to a remote workspace, and build applications by composing reusable services rather than recreating common infrastructure.
+
+[Platform 2040](https://platform2040.com/) provides the intended VPS side of that workflow. It provisions and manages consistently structured application workspaces; `codexl` and `claudel` connect your local terminal to those workspaces so your chosen coding agent can build, test, and deploy there.
+
+Platform 2040 is not a hard dependency. `workon` can connect to any compatible VPS whose projects live under `~/apps` and whose EC2 and SSH configuration follows the conventions below.
+
 ## Requirements
 
 On your local computer:
