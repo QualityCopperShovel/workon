@@ -1,0 +1,94 @@
+#!/bin/bash
+
+set -eu
+
+ROOT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
+# shellcheck source=../workon-common
+. "$ROOT_DIR/workon-common"
+
+TEST_TMP=$(mktemp -d)
+trap 'rm -rf "$TEST_TMP"' EXIT
+
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
+assert_eq() {
+    [ "$1" = "$2" ] || fail "expected '$2', got '$1'"
+}
+
+AWS_BEHAVIOR=success
+AWS_MARKER="$TEST_TMP/aws-called"
+aws() {
+    : > "$AWS_MARKER"
+    case "$AWS_BEHAVIOR" in
+        success) printf '%s\n' 'server-one server-two' ;;
+        empty) return 0 ;;
+        failure)
+            echo 'network unavailable' >&2
+            return 42
+            ;;
+    esac
+}
+
+WORKON_CACHE_DIR="$TEST_TMP/cache"
+WORKON_HOSTS_CACHE="$WORKON_CACHE_DIR/hosts"
+mkdir -p "$WORKON_CACHE_DIR"
+
+workon_is_valid_hosts_output 'server-one server_two.example' || fail 'valid hosts rejected'
+if workon_is_valid_hosts_output 'server-one: malicious'; then
+    fail 'invalid hosts accepted'
+fi
+
+printf '%s\n' 'cached-server' > "$WORKON_HOSTS_CACHE"
+WORKON_CACHE_TTL=999999
+rm -f "$AWS_MARKER"
+assert_eq "$(workon_get_hosts)" 'cached-server'
+[ ! -e "$AWS_MARKER" ] || fail 'fresh cache unexpectedly queried AWS'
+
+WORKON_CACHE_TTL=0
+AWS_BEHAVIOR=failure
+assert_eq "$(workon_get_hosts)" 'cached-server'
+
+printf '%s\n' 'invalid host output!' > "$WORKON_HOSTS_CACHE"
+if workon_get_hosts >/dev/null 2>&1; then
+    fail 'AWS failure with invalid cache unexpectedly succeeded'
+fi
+
+rm -f "$WORKON_HOSTS_CACHE"
+AWS_BEHAVIOR=empty
+if workon_get_hosts >/dev/null 2>&1; then
+    fail 'empty AWS response unexpectedly succeeded'
+fi
+
+AWS_BEHAVIOR=success
+assert_eq "$(workon_get_hosts)" 'server-one server-two'
+assert_eq "$(cat "$WORKON_HOSTS_CACHE")" 'server-one server-two'
+
+workon_configure_ssh
+case "$WORKON_SSH_OPTS" in
+    *'ControlMaster=no'*'ControlPath=none'*) ;;
+    *) fail 'SSH options do not disable persistent masters' ;;
+esac
+
+WORKON_CONNECT_TIMEOUT='5 -o ProxyCommand=evil'
+if workon_configure_ssh >/dev/null 2>&1; then
+    fail 'unsafe SSH timeout setting unexpectedly accepted'
+fi
+WORKON_CONNECT_TIMEOUT=5
+
+# Installed commands live behind symlinks. Verify the real command can locate
+# its shared library before it attempts host discovery.
+SYMLINK_DIR="$TEST_TMP/bin"
+mkdir -p "$SYMLINK_DIR"
+ln -s "$ROOT_DIR/workon-core" "$SYMLINK_DIR/workon-core"
+mkdir -p "$TEST_TMP/integration-cache"
+printf '%s\n' 'cached-server' > "$TEST_TMP/integration-cache/hosts"
+if ! WORKON_CACHE_DIR="$TEST_TMP/integration-cache" \
+     WORKON_HOSTS_CACHE="$TEST_TMP/integration-cache/hosts" \
+     "$SYMLINK_DIR/workon-core" --help >/dev/null; then
+    fail 'workon-core failed when invoked through a symlink'
+fi
+
+echo 'workon-common tests passed'

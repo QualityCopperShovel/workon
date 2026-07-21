@@ -1,40 +1,95 @@
 #!/bin/bash
 
-# newproject - SSH to server, create a new project with standard infrastructure, and start claude
+# newproject - SSH to server, create a new project with standard infrastructure, and start codex
+# Uses first server from ~/.workon_hosts by default, or specify with --server
 
 set -e
 
-# Read SSH host from config file
-if [ ! -f ~/.workon_host ]; then
-    echo "Error: ~/.workon_host not found"
-    echo ""
-    echo "1. Add your server to ~/.ssh/config:"
-    echo ""
-    echo "   Host myserver"
-    echo "       HostName your.server.com"
-    echo "       User your-username"
-    echo "       IdentityFile ~/.ssh/your-key"
-    echo ""
-    echo "2. Create ~/.workon_host with that host name:"
-    echo ""
-    echo "   echo 'myserver' > ~/.workon_host"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SCRIPT_SOURCE" ]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=workon-common
+. "$SCRIPT_DIR/workon-common"
+
+if ! SSH_HOSTS_OUTPUT=$(workon_get_hosts); then
     exit 1
 fi
-SSH_HOST=$(cat ~/.workon_host | tr -d '[:space:]')
 
-if [ -z "$1" ]; then
+# Convert space-separated output to array
+read -ra SSH_HOSTS <<< "$SSH_HOSTS_OUTPUT"
+
+if [ ${#SSH_HOSTS[@]} -eq 0 ]; then
+    echo "Error: No running EC2 instances found with Workon=true tag"
+    echo ""
+    echo "Tag your instances with: aws ec2 create-tags --resources <instance-id> --tags Key=Workon,Value=true"
+    exit 1
+fi
+
+# Parse arguments: newproject [server] <project>
+SSH_HOST=""
+PROJECT_NAME=""
+
+if [ $# -eq 2 ]; then
+    # Two args: first is server prefix, second is project name
+    SERVER_PREFIX="$1"
+    PROJECT_NAME="$2"
+
+    # Find matching server (case-insensitive prefix match)
+    shopt -s nocasematch
+    for host in "${SSH_HOSTS[@]}"; do
+        if [[ "$host" == "${SERVER_PREFIX}"* ]]; then
+            if [ -n "$SSH_HOST" ]; then
+                echo "Error: Server prefix '$SERVER_PREFIX' matches multiple servers: $SSH_HOST, $host"
+                exit 1
+            fi
+            SSH_HOST="$host"
+        fi
+    done
+    shopt -u nocasematch
+
+    if [ -z "$SSH_HOST" ]; then
+        echo "Error: No server matches prefix '$SERVER_PREFIX'"
+        echo ""
+        echo "Available servers:"
+        for host in "${SSH_HOSTS[@]}"; do
+            echo "  - $host"
+        done
+        exit 1
+    fi
+elif [ $# -eq 1 ]; then
+    PROJECT_NAME="$1"
+    SSH_HOST="${SSH_HOSTS[0]}"
+fi
+
+if [ -z "$PROJECT_NAME" ]; then
     echo "Usage: newproject <project_name>"
+    echo "       newproject <server> <project_name>"
     echo "Example: newproject myapp"
+    echo "Example: newproject finance open-ended"
+    echo ""
+    echo "If a server is specified, it matches by prefix (case-insensitive)."
+    echo "If no server is specified, uses the first available server."
     echo ""
     echo "Creates a new project with standard infrastructure:"
     echo "  - App user: app_<name>"
     echo "  - Code directory: ~/apps/<name>/"
     echo "  - Data directory: /home/app_<name>/data/"
     echo "  - VERSION file initialized to 1.0.0"
+    echo ""
+    echo "Available servers:"
+    for host in "${SSH_HOSTS[@]}"; do
+        if [ "$host" = "${SSH_HOSTS[0]}" ]; then
+            echo "  - $host (default)"
+        else
+            echo "  - $host"
+        fi
+    done
     exit 1
 fi
-
-PROJECT_NAME="$1"
 
 # Validate project name (lowercase, alphanumeric, underscores, hyphens)
 if [[ ! "$PROJECT_NAME" =~ ^[a-z0-9_-]+$ ]]; then
@@ -43,14 +98,19 @@ if [[ ! "$PROJECT_NAME" =~ ^[a-z0-9_-]+$ ]]; then
     exit 1
 fi
 
+echo "Creating project '$PROJECT_NAME' on $SSH_HOST"
+
 # Set iTerm2 tab title
 echo -ne "\033]0;${PROJECT_NAME}\007"
 
+workon_configure_ssh
+SSH_OPTS="$WORKON_SSH_OPTS"
+
 # SSH and run remote commands
-ssh -t "$SSH_HOST" bash -c "'
+ssh -t $SSH_OPTS "$SSH_HOST" bash -c "'
     set -e
 
-    # Load nvm to get the correct node/claude
+    # Load nvm to get the correct node/codex
     export NVM_DIR=\"\$HOME/.nvm\"
     [ -s \"\$NVM_DIR/nvm.sh\" ] && . \"\$NVM_DIR/nvm.sh\"
 
@@ -73,7 +133,7 @@ ssh -t "$SSH_HOST" bash -c "'
         echo \"App user \$APP_USER already exists\"
     else
         echo \"Creating app user: \$APP_USER\"
-        sudo useradd -m -s /bin/false \"\$APP_USER\"
+        sudo useradd -m -s /usr/sbin/nologin \"\$APP_USER\"
     fi
 
     # 2. Create data directory
@@ -97,20 +157,7 @@ ssh -t "$SSH_HOST" bash -c "'
     echo \"  Data: \$DATA_DIR\"
     echo \"  User: \$APP_USER\"
     echo \"========================================\"
-    echo \"\"
-    echo \"Starting Claude session...\"
-
-    # Update iTerm2 tab title
-    echo -ne \"\\033]0;\${PROJECT_NAME}\\007\"
-
-    # Create tmux session and launch claude
-    SESSION_NAME=\"\$PROJECT_NAME\"
-
-    if tmux has-session -t \"\$SESSION_NAME\" 2>/dev/null; then
-        echo \"Attaching to existing tmux session: \$SESSION_NAME\"
-        tmux attach-session -t \"\$SESSION_NAME\"
-    else
-        echo \"Creating new tmux session: \$SESSION_NAME\"
-        tmux new-session -s \"\$SESSION_NAME\" -c \"\$PROJECT_DIR\" \"cd \$PROJECT_DIR && claude --dangerously-skip-permissions\"
-    fi
 '"
+
+# Now start working on the project
+exec "$SCRIPT_DIR/codexl" "${SSH_HOST}/${PROJECT_NAME}"

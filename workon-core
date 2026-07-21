@@ -1,0 +1,872 @@
+#!/bin/bash
+
+# workon - SSH to server and open/resume a tmux session for a project
+# Tries servers in order from ~/.workon_hosts until the project is found
+
+set -e
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SCRIPT_SOURCE" ]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ "$SCRIPT_SOURCE" != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+# shellcheck source=workon-common
+. "$SCRIPT_DIR/workon-common"
+
+CACHE_DIR="$WORKON_CACHE_DIR"
+CLIENT="codex"
+
+print_usage() {
+    echo "Usage: workon [--client claude|codex] <project_name_pattern> [session_number]"
+    echo "       workon [--client claude|codex] <server>/<pattern> [session_number]"
+    echo "Example: workon myapp  (open slot 1, creating it if needed)"
+    echo "Example: workon myapp 2  (open session slot 2, creating it if needed)"
+    echo "Example: workon foo bar 2  (project 'foo bar', session 2)"
+    echo "Example: workon --client codex myapp"
+    echo "Example: workon finance/dcf  (dcf on the finance server)"
+    echo "         --client claude|codex   Coding client to run in tmux (default: codex)"
+    echo ""
+    echo "Servers (in priority order):"
+    for host in "${SSH_HOSTS[@]}"; do
+        echo "  - $host"
+    done
+}
+
+echo -n "Loading hosts..."
+if ! SSH_HOSTS_OUTPUT=$(workon_get_hosts); then
+    exit 1
+fi
+echo " done"
+
+# Convert space-separated output to array
+read -ra SSH_HOSTS <<< "$SSH_HOSTS_OUTPUT"
+
+if [ ${#SSH_HOSTS[@]} -eq 0 ]; then
+    echo "Error: No running EC2 instances found with Workon=true tag"
+    echo ""
+    echo "Tag your instances with: aws ec2 create-tags --resources <instance-id> --tags Key=Workon,Value=true"
+    exit 1
+fi
+
+POSITIONAL_ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --client)
+            if [ -z "${2:-}" ]; then
+                echo "Error: --client requires a value."
+                print_usage
+                exit 1
+            fi
+            CLIENT="$2"
+            shift 2
+            ;;
+        --client=*)
+            CLIENT="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --)
+            shift
+            POSITIONAL_ARGS+=("$@")
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'"
+            print_usage
+            exit 1
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+case "$CLIENT" in
+    claude|codex) ;;
+    *)
+        echo "Error: Unknown client '$CLIENT'. Use --client claude or --client codex."
+        print_usage
+        exit 1
+        ;;
+esac
+
+set -- "${POSITIONAL_ARGS[@]}"
+
+if [ -z "${1:-}" ]; then
+    print_usage
+    exit 1
+fi
+
+# Parse trailing bare session number.
+SESSION_NUM=""
+while [ "$#" -gt 1 ]; do
+    LAST_TOKEN="${@: -1}"
+
+    case "$LAST_TOKEN" in
+        [Rr][Ee][Ss][Uu][Mm][Ee]|[Nn][Ee][Ww])
+            echo "Error: '$LAST_TOKEN' mode has been removed. Use a numeric session slot instead."
+            print_usage
+            exit 1
+            ;;
+    esac
+
+    if [ -z "$SESSION_NUM" ] && [[ "$LAST_TOKEN" =~ ^[0-9]+$ ]]; then
+        SESSION_NUM="$LAST_TOKEN"
+        set -- "${@:1:$#-1}"
+        continue
+    fi
+
+    break
+done
+
+PATTERN="$*"
+
+# Check for server/pattern syntax to disambiguate across servers
+FORCE_HOST=""
+if [[ "$PATTERN" == */* ]]; then
+    SERVER_PREFIX="${PATTERN%%/*}"
+    PATTERN="${PATTERN#*/}"
+    # Find matching server (case-insensitive prefix match)
+    shopt -s nocasematch
+    for host in "${SSH_HOSTS[@]}"; do
+        if [[ "$host" == "${SERVER_PREFIX}"* ]]; then
+            if [ -n "$FORCE_HOST" ]; then
+                echo "Error: Server prefix '$SERVER_PREFIX' matches multiple servers: $FORCE_HOST, $host"
+                exit 1
+            fi
+            FORCE_HOST="$host"
+        fi
+    done
+    shopt -u nocasematch
+    if [ -z "$FORCE_HOST" ]; then
+        echo "Error: No server matches prefix '$SERVER_PREFIX'"
+        echo ""
+        echo "Available servers:"
+        for host in "${SSH_HOSTS[@]}"; do
+            echo "  - $host"
+        done
+        exit 1
+    fi
+fi
+
+# Build initial tab title (session name is finalized after project resolution)
+TAB_TITLE="${PATTERN}"
+
+# Set iTerm2 tab title locally before SSH
+echo -ne "\033]0;${TAB_TITLE}\007"
+
+workon_configure_ssh
+SSH_OPTS="$WORKON_SSH_OPTS"
+SSH_INTERACTIVE_OPTS="$SSH_OPTS"
+
+# Try each server and collect all matches (in parallel)
+declare -a CANDIDATE_HOSTS=()
+declare -a CANDIDATE_PROJECTS=()
+declare -a CANDIDATE_SCORES=()
+
+# If a server was specified, only search that one
+if [ -n "$FORCE_HOST" ]; then
+    SEARCH_HOSTS=("$FORCE_HOST")
+else
+    SEARCH_HOSTS=("${SSH_HOSTS[@]}")
+fi
+
+to_lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+normalize_name() {
+    to_lower "$1" | tr -cd '[:alnum:]'
+}
+
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[|&]/\\&/g'
+}
+
+is_similar_project_name() {
+    local left="$1"
+    local right="$2"
+    local left_lc right_lc left_norm right_norm
+
+    left_lc=$(to_lower "$left")
+    right_lc=$(to_lower "$right")
+    left_norm=$(normalize_name "$left")
+    right_norm=$(normalize_name "$right")
+
+    if [ "$left_lc" = "$right_lc" ] || [ "$left_norm" = "$right_norm" ]; then
+        return 0
+    fi
+
+    if [[ "$left_lc" =~ (^|[^[:alnum:]])$right_lc([^[:alnum:]]|$) ]] || \
+       [[ "$right_lc" =~ (^|[^[:alnum:]])$left_lc([^[:alnum:]]|$) ]]; then
+        return 0
+    fi
+
+    if [ -n "$left_norm" ] && [ -n "$right_norm" ]; then
+        if [[ "$left_norm" == "$right_norm"* || "$right_norm" == "$left_norm"* ]]; then
+            local len_diff=$(( ${#left_norm} - ${#right_norm} ))
+            if [ "${len_diff#-}" -le 2 ]; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+score_candidate() {
+    local query="$1"
+    local candidate="$2"
+    local query_lc candidate_lc query_norm candidate_norm
+    local qlen clen idx pos start_pos end_pos span penalty
+
+    query_lc=$(to_lower "$query")
+    candidate_lc=$(to_lower "$candidate")
+    query_norm=$(normalize_name "$query")
+    candidate_norm=$(normalize_name "$candidate")
+
+    if [ "$candidate_lc" = "$query_lc" ]; then
+        echo 1000
+        return
+    fi
+
+    if [ -n "$query_norm" ] && [ "$candidate_norm" = "$query_norm" ]; then
+        echo 950
+        return
+    fi
+
+    if [[ "$candidate_lc" == "$query_lc"* ]]; then
+        echo $((900 - (${#candidate_lc} - ${#query_lc})))
+        return
+    fi
+
+    if [[ "$candidate_lc" == *"$query_lc"* ]]; then
+        echo $((800 - (${#candidate_lc} - ${#query_lc})))
+        return
+    fi
+
+    qlen=${#query_lc}
+    clen=${#candidate_lc}
+    start_pos=-1
+    end_pos=-1
+    pos=0
+
+    for (( idx=0; idx<qlen; idx++ )); do
+        local ch="${query_lc:$idx:1}"
+        local found=0
+        while [ "$pos" -lt "$clen" ]; do
+            if [ "${candidate_lc:$pos:1}" = "$ch" ]; then
+                if [ "$start_pos" -lt 0 ]; then
+                    start_pos=$pos
+                fi
+                end_pos=$pos
+                pos=$((pos + 1))
+                found=1
+                break
+            fi
+            pos=$((pos + 1))
+        done
+        if [ "$found" -eq 0 ]; then
+            echo 0
+            return
+        fi
+    done
+
+    span=$((end_pos - start_pos + 1))
+    penalty=$(((span - qlen) + (clen - qlen)))
+    echo $((700 - penalty))
+}
+
+# Temp dir for parallel results
+RESULTS_DIR=$(mktemp -d)
+trap 'kill $(jobs -p) 2>/dev/null; rm -rf '"$RESULTS_DIR" EXIT
+
+# Search all servers in parallel
+echo -n "Searching ${#SEARCH_HOSTS[@]} server(s)..."
+for SSH_HOST in "${SEARCH_HOSTS[@]}"; do
+    (
+        set +e
+        # Fetch names without embedding user input in a remote shell command.
+        # Matching and scoring happen locally below.
+        MATCHES=$(ssh $SSH_OPTS "$SSH_HOST" "find ~/apps -mindepth 1 -maxdepth 1 -type d -exec basename {} \\; 2>/dev/null" 2>/dev/null)
+        if [ -n "$MATCHES" ]; then
+            echo "$MATCHES" > "$RESULTS_DIR/$SSH_HOST"
+        fi
+    ) &
+done
+
+# Wait for all searches to complete
+wait
+echo " done"
+
+# Collect results
+for SSH_HOST in "${SEARCH_HOSTS[@]}"; do
+    if [ -f "$RESULTS_DIR/$SSH_HOST" ]; then
+        MATCHES=$(cat "$RESULTS_DIR/$SSH_HOST")
+        while IFS= read -r match; do
+            [ -z "$match" ] && continue
+            # Project names are later used in paths, tmux names, and generated
+            # launcher scripts. Reject control characters and shell syntax.
+            if [[ ! "$match" =~ ^[A-Za-z0-9._][A-Za-z0-9._\ -]*$ ]]; then
+                echo "Warning: ignoring unsafe project name from $SSH_HOST" >&2
+                continue
+            fi
+            MATCH_SCORE=$(score_candidate "$PATTERN" "$match")
+            [ "$MATCH_SCORE" -le 0 ] && continue
+            CANDIDATE_HOSTS+=("$SSH_HOST")
+            CANDIDATE_PROJECTS+=("$match")
+            CANDIDATE_SCORES+=("$MATCH_SCORE")
+        done <<< "$MATCHES"
+    fi
+done
+
+# Pick the best candidate globally
+if [ ${#CANDIDATE_HOSTS[@]} -gt 0 ]; then
+    BEST_INDEX=0
+    SECOND_INDEX=-1
+    for i in "${!CANDIDATE_HOSTS[@]}"; do
+        if [ "${CANDIDATE_SCORES[$i]}" -gt "${CANDIDATE_SCORES[$BEST_INDEX]}" ]; then
+            SECOND_INDEX=$BEST_INDEX
+            BEST_INDEX=$i
+        elif [ "$i" -ne "$BEST_INDEX" ]; then
+            if [ "$SECOND_INDEX" -lt 0 ] || [ "${CANDIDATE_SCORES[$i]}" -gt "${CANDIDATE_SCORES[$SECOND_INDEX]}" ]; then
+                SECOND_INDEX=$i
+            fi
+        fi
+    done
+
+    if [ "$SECOND_INDEX" -ge 0 ]; then
+        BEST_SCORE="${CANDIDATE_SCORES[$BEST_INDEX]}"
+        SECOND_SCORE="${CANDIDATE_SCORES[$SECOND_INDEX]}"
+        SCORE_GAP=$((BEST_SCORE - SECOND_SCORE))
+        if [ "${CANDIDATE_HOSTS[$BEST_INDEX]}" != "${CANDIDATE_HOSTS[$SECOND_INDEX]}" ] && \
+           is_similar_project_name "${CANDIDATE_PROJECTS[$BEST_INDEX]}" "${CANDIDATE_PROJECTS[$SECOND_INDEX]}" && \
+           { { [ "$SECOND_SCORE" -ge 850 ] && [ "$SCORE_GAP" -le 40 ]; } || \
+             { [ "$BEST_SCORE" -ge 950 ] && [ "$SECOND_SCORE" -ge 750 ]; }; }; then
+            echo "Error: ambiguous project match for '$PATTERN'"
+            echo "  - ${CANDIDATE_PROJECTS[$BEST_INDEX]} on ${CANDIDATE_HOSTS[$BEST_INDEX]} (score: $BEST_SCORE)"
+            echo "  - ${CANDIDATE_PROJECTS[$SECOND_INDEX]} on ${CANDIDATE_HOSTS[$SECOND_INDEX]} (score: $SECOND_SCORE)"
+            echo ""
+            echo "Specify the server explicitly:"
+            echo "  codexl ${CANDIDATE_HOSTS[$BEST_INDEX]}/$PATTERN"
+            echo "  codexl ${CANDIDATE_HOSTS[$SECOND_INDEX]}/$PATTERN"
+            exit 1
+        fi
+    fi
+fi
+
+FOUND_HOST="${CANDIDATE_HOSTS[$BEST_INDEX]:-}"
+FOUND_PROJECT="${CANDIDATE_PROJECTS[$BEST_INDEX]:-}"
+
+if [ -z "$FOUND_HOST" ]; then
+    echo "Error: No directory matching '$PATTERN' found on any server"
+    echo ""
+    echo "Checked servers:"
+    for host in "${SSH_HOSTS[@]}"; do
+        echo "  - $host"
+    done
+    echo ""
+    echo "Available projects per server:"
+    for host in "${SSH_HOSTS[@]}"; do
+        echo ""
+        echo "[$host]"
+        ssh $SSH_OPTS "$host" "find ~/apps -mindepth 1 -maxdepth 1 -type d -exec basename {} \\; 2>/dev/null | sort" 2>/dev/null || echo "  (could not connect)"
+    done
+    exit 1
+fi
+
+echo "Found '$FOUND_PROJECT' on $FOUND_HOST"
+
+TAB_TITLE="${FOUND_HOST}:${FOUND_PROJECT}"
+echo -ne "\033]0;${TAB_TITLE}\007"
+
+if [ -z "$FOUND_PROJECT" ]; then
+    echo "Error: Empty project name was resolved for pattern '$PATTERN'."
+    exit 1
+fi
+
+echo "Connecting to $FOUND_HOST..."
+
+# SSH and run remote commands
+REMOTE_SCRIPT=$(cat <<'REMOTE_EOF'
+    set -e
+
+    REQUESTED_CLIENT="$1"
+    PROJECT="$2"
+    SESSION_NUM="$3"
+
+    if [ -z "$PROJECT" ]; then
+        echo "Error: Resolved project name is empty."
+        exit 1
+    fi
+
+    # Add user-level install locations before loading nvm and launching the client.
+    export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+
+    # Load nvm to get the correct node/claude
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+    escape_sed_replacement() {
+        printf '%s' "$1" | sed 's/[|&]/\\&/g'
+    }
+
+    PROJECT_DIR="$HOME/apps/$PROJECT"
+    export PROJECT_DIR
+    export PROJECT
+    PROJECT_DIR_ESCAPED=$(printf '%q' "$PROJECT_DIR")
+    PROJECT_ESCAPED=$(escape_sed_replacement "$PROJECT")
+    PROJECT_DIR_SUB_ESCAPED=$(escape_sed_replacement "$PROJECT_DIR")
+
+    # Write a launcher script to avoid quoting issues through the
+    # local->ssh->bash-c->tmux->sh-c chain, which was dropping flags.
+    LAUNCHER_DIR="$HOME/.cache/workon"
+    mkdir -p -m 700 "$LAUNCHER_DIR"
+    chmod 700 "$LAUNCHER_DIR"
+    LAUNCHER="$LAUNCHER_DIR/launch-${PROJECT// /-}.sh"
+
+    launcher_apply_context() {
+        sed -i \
+            -e "s|__WORKON_PROJECT__|$PROJECT_ESCAPED|g" \
+            -e "s|__WORKON_PROJECT_DIR__|$PROJECT_DIR_SUB_ESCAPED|g" \
+            "$LAUNCHER"
+    }
+
+    if [ "$REQUESTED_CLIENT" = "codex" ]; then
+        cat > "$LAUNCHER" <<'LAUNCH_EOF'
+#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+export WORKON_LAUNCH_PROJECT="__WORKON_PROJECT__"
+export WORKON_LAUNCH_PROJECT_DIR="__WORKON_PROJECT_DIR__"
+PROJECT="$WORKON_LAUNCH_PROJECT"
+PROJECT_DIR="$WORKON_LAUNCH_PROJECT_DIR"
+export PROJECT PROJECT_DIR
+cd "$PROJECT_DIR" || exit 1
+
+TMUX_SESSION_NAME=$(tmux display-message -p '#S' 2>/dev/null || printf '%s' "$PROJECT")
+STATE_KEY=$(printf '%s\n%s\n' "$PROJECT_DIR" "$TMUX_SESSION_NAME" | shasum -a 1 | awk '{print $1}')
+STATE_FILE="$HOME/.cache/workon/codex-session-$STATE_KEY"
+SESSION_ID_REGEX='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+DEBUG_LOG="$HOME/.cache/workon/codex-debug-${TMUX_SESSION_NAME// /-}.log"
+CURRENT_CODEX_SESSION_ID=""
+
+debug_log() {
+    printf '%s %s\n' "$(date -Is)" "$*" >> "$DEBUG_LOG"
+}
+
+debug_log "launcher start project=$PROJECT project_dir=$PROJECT_DIR tmux_session=$TMUX_SESSION_NAME pwd=$PWD"
+
+set_tmux_session_env() {
+    tmux set-environment -t "=$TMUX_SESSION_NAME" "$1" "$2" 2>/dev/null || true
+}
+
+mark_codex_session_pending() {
+    CURRENT_CODEX_SESSION_ID=""
+    set_tmux_session_env WORKON_CODEX_SESSION_STATUS pending
+    set_tmux_session_env WORKON_CODEX_SESSION_ID ""
+}
+
+mark_codex_session_ready() {
+    CURRENT_CODEX_SESSION_ID="$1"
+    set_tmux_session_env WORKON_CODEX_SESSION_STATUS ready
+    set_tmux_session_env WORKON_CODEX_SESSION_ID "$1"
+}
+
+session_id_from_path() {
+    local base
+    base=$(basename "$1")
+    if [[ "$base" =~ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+valid_session_id() {
+    [[ "$1" =~ $SESSION_ID_REGEX ]]
+}
+
+session_meta_matches_project_dir() {
+    local meta
+    meta=$(grep -F -m1 "\"type\":\"session_meta\"" "$1" 2>/dev/null) || return 1
+    [[ "$meta" == *"\"cwd\":\"$PROJECT_DIR\""* ]] || return 1
+    [[ "$meta" != *"\"originator\":\"codex_exec\""* ]] || return 1
+    [[ "$meta" != *"\"source\":\"exec\""* ]] || return 1
+}
+
+session_path_for_id() {
+    find "$HOME/.codex/sessions" -type f -name "rollout-*-$1.jsonl" -print -quit 2>/dev/null
+}
+
+session_id_matches_project_dir() {
+    local path
+    path=$(session_path_for_id "$1")
+    [ -n "$path" ] || return 1
+    session_meta_matches_project_dir "$path"
+}
+
+session_id_owned_by_process_tree() {
+    local root_pid="$1"
+    local pending_pids="$root_pid"
+    local pid child fd path session_id
+
+    # Codex keeps its active rollout open. Follow the launcher's descendants and
+    # identify that exact file instead of guessing from the newest rollout in a
+    # project directory shared by several workon slots.
+    while [ -n "$pending_pids" ]; do
+        pid=${pending_pids%% *}
+        if [ "$pending_pids" = "$pid" ]; then
+            pending_pids=""
+        else
+            pending_pids=${pending_pids#* }
+        fi
+
+        for fd in "/proc/$pid/fd/"*; do
+            [ -e "$fd" ] || continue
+            path=$(readlink "$fd" 2>/dev/null || true)
+            if [[ "$path" == "$HOME/.codex/sessions/"*/rollout-*.jsonl ]]; then
+                session_meta_matches_project_dir "$path" || continue
+                session_id=$(session_id_from_path "$path") || continue
+                printf '%s\n' "$session_id"
+                return 0
+            fi
+        done
+
+        while IFS= read -r child; do
+            child=${child//[[:space:]]/}
+            [ -n "$child" ] && pending_pids="$pending_pids${pending_pids:+ }$child"
+        done < <(ps -eo pid=,ppid= 2>/dev/null | awk -v parent="$pid" '$2 == parent { print $1 }')
+    done
+    return 1
+}
+
+track_owned_codex_session_id() {
+    local launcher_pid="$1"
+    local current_id=""
+    local observed_id
+
+    while :; do
+        observed_id=$(session_id_owned_by_process_tree "$launcher_pid" || true)
+        if valid_session_id "$observed_id" && [ "$observed_id" != "$current_id" ]; then
+            current_id="$observed_id"
+            mark_codex_session_ready "$current_id"
+            debug_log "process-owned session id=$current_id"
+        fi
+        sleep 1
+    done
+}
+
+sync_current_session_id_from_tmux() {
+    local status_env id_env status session_id
+    status_env=$(tmux show-environment -t "=$TMUX_SESSION_NAME" WORKON_CODEX_SESSION_STATUS 2>/dev/null || true)
+    id_env=$(tmux show-environment -t "=$TMUX_SESSION_NAME" WORKON_CODEX_SESSION_ID 2>/dev/null || true)
+    status=${status_env#WORKON_CODEX_SESSION_STATUS=}
+    session_id=${id_env#WORKON_CODEX_SESSION_ID=}
+    if [ "$status" = "ready" ] && valid_session_id "$session_id" && session_id_matches_project_dir "$session_id"; then
+        CURRENT_CODEX_SESSION_ID="$session_id"
+        return 0
+    fi
+    return 1
+}
+
+session_id_claimed_by_another_slot() {
+    local session_id="$1"
+    local candidate candidate_id
+    for candidate in "$HOME/.cache/workon/codex-session-"*; do
+        [ -f "$candidate" ] || continue
+        [ "$candidate" = "$STATE_FILE" ] && continue
+        candidate_id=$(head -n1 "$candidate" 2>/dev/null | tr -d '[:space:]')
+        [ "$candidate_id" = "$session_id" ] && return 0
+    done
+    return 1
+}
+
+persist_current_session_id() {
+    if valid_session_id "$CURRENT_CODEX_SESSION_ID" && session_id_matches_project_dir "$CURRENT_CODEX_SESSION_ID"; then
+        printf '%s\n' "$CURRENT_CODEX_SESSION_ID" > "$STATE_FILE"
+    fi
+}
+
+run_codex() {
+    local saved_id
+    local tracker_pid
+    local status
+
+    launch_fresh_codex() {
+        debug_log "launch_fresh_codex"
+        mark_codex_session_pending
+        track_owned_codex_session_id "$$" &
+        tracker_pid=$!
+        codex -C "$PROJECT_DIR"
+        status=$?
+        kill "$tracker_pid" 2>/dev/null || true
+        wait "$tracker_pid" 2>/dev/null || true
+        sync_current_session_id_from_tmux || true
+        debug_log "launch_fresh_codex exit_status=$status owned_id=${CURRENT_CODEX_SESSION_ID:-<none>}"
+        return "$status"
+    }
+
+    if [ -f "$STATE_FILE" ]; then
+        saved_id=$(head -n1 "$STATE_FILE" 2>/dev/null | tr -d '[:space:]')
+        debug_log "state_file candidate saved_id=${saved_id:-<none>}"
+        if valid_session_id "$saved_id" && session_id_matches_project_dir "$saved_id" && ! session_id_claimed_by_another_slot "$saved_id"; then
+            mark_codex_session_ready "$saved_id"
+            debug_log "resuming saved_id=$saved_id"
+            track_owned_codex_session_id "$$" &
+            tracker_pid=$!
+            codex resume "$saved_id" -C "$PROJECT_DIR"
+            status=$?
+            kill "$tracker_pid" 2>/dev/null || true
+            wait "$tracker_pid" 2>/dev/null || true
+            sync_current_session_id_from_tmux || true
+
+            if [ "$status" -eq 0 ]; then
+                return 0
+            fi
+            debug_log "resume saved_id failed saved_id=$saved_id status=$status"
+        elif valid_session_id "$saved_id" && session_id_claimed_by_another_slot "$saved_id"; then
+            debug_log "rejecting duplicate slot claim saved_id=$saved_id"
+        fi
+        rm -f "$STATE_FILE"
+    fi
+
+    debug_log "no slot-local resumable session found; starting fresh"
+    launch_fresh_codex
+}
+
+run_codex
+STATUS=$?
+persist_current_session_id
+debug_log "launcher end status=$STATUS persisted_state_file=$STATE_FILE"
+exit $STATUS
+LAUNCH_EOF
+        launcher_apply_context
+    elif [ "$REQUESTED_CLIENT" = "claude" ]; then
+        cat > "$LAUNCHER" <<'LAUNCH_EOF'
+#!/bin/bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+export WORKON_LAUNCH_PROJECT="__WORKON_PROJECT__"
+export WORKON_LAUNCH_PROJECT_DIR="__WORKON_PROJECT_DIR__"
+PROJECT="$WORKON_LAUNCH_PROJECT"
+PROJECT_DIR="$WORKON_LAUNCH_PROJECT_DIR"
+export PROJECT PROJECT_DIR
+cd "$PROJECT_DIR" || exit 1
+exec claude
+LAUNCH_EOF
+        launcher_apply_context
+    else
+        echo "Error: Unsupported client '$REQUESTED_CLIENT'."
+        exit 1
+    fi
+    chmod 700 "$LAUNCHER"
+    CLIENT_CMD="$LAUNCHER"
+    SESSION_ID_REGEX='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    REMOTE_DEBUG_LOG="$HOME/.cache/workon/remote-debug-${PROJECT// /-}.log"
+
+    remote_debug_log() {
+        printf '%s %s\n' "$(date -Is)" "$*" >> "$REMOTE_DEBUG_LOG"
+    }
+
+    remote_debug_log "remote start project=$PROJECT project_dir=$PROJECT_DIR requested_client=$REQUESTED_CLIENT session_num=${SESSION_NUM:-1}"
+
+    valid_session_id() {
+        [[ "$1" =~ $SESSION_ID_REGEX ]]
+    }
+
+    session_meta_matches_project_dir() {
+        local meta
+        meta=$(grep -F -m1 "\"type\":\"session_meta\"" "$1" 2>/dev/null) || return 1
+        [[ "$meta" == *"\"cwd\":\"$PROJECT_DIR\""* ]] || return 1
+        [[ "$meta" != *"\"originator\":\"codex_exec\""* ]] || return 1
+        [[ "$meta" != *"\"source\":\"exec\""* ]] || return 1
+    }
+
+    session_path_for_id() {
+        find "$HOME/.codex/sessions" -type f -name "rollout-*-$1.jsonl" -print -quit 2>/dev/null
+    }
+
+    session_id_matches_project_dir() {
+        local path
+        path=$(session_path_for_id "$1")
+        [ -n "$path" ] || return 1
+        session_meta_matches_project_dir "$path"
+    }
+
+    mark_session_used() {
+        tmux set-environment -t "=$1" WORKON_LAST_USED "$(date +%s)" 2>/dev/null || true
+    }
+
+    pane_runtime_info() {
+        tmux list-panes -t "=$1" -F "#{pane_dead}|#{pane_current_command}|#{pane_current_path}" 2>/dev/null | head -1
+    }
+
+    attached_client_count() {
+        tmux list-clients -t "=$1" -F "#{client_tty}" 2>/dev/null | wc -l | tr -d ' '
+    }
+
+    is_shell_command() {
+        if [ "$1" = "bash" ] || [ "$1" = "zsh" ] || [ "$1" = "sh" ]; then
+            return 0
+        fi
+        return 1
+    }
+
+    if [ -n "$SESSION_NUM" ]; then
+        if [ "$SESSION_NUM" -lt 1 ]; then
+            echo "Error: session number must be 1 or greater."
+            exit 1
+        fi
+
+        if [ "$SESSION_NUM" -eq 1 ]; then
+            SESSION_NAME="$PROJECT"
+        else
+            SESSION_NAME="${PROJECT} ${SESSION_NUM}"
+        fi
+    else
+        SESSION_NAME="$PROJECT"
+    fi
+
+    if [ -z "$SESSION_NAME" ]; then
+        echo "Error: Could not resolve a tmux session name for project \"$PROJECT\"."
+        exit 1
+    fi
+
+    remote_debug_log "resolved session_name=$SESSION_NAME"
+
+    # Update iTerm2 tab title with actual session name
+    echo -ne "\033]0;${SESSION_NAME}\007"
+
+    start_session() {
+        echo "Creating new tmux session: $SESSION_NAME"
+        remote_debug_log "start_session session_name=$SESSION_NAME client_cmd=$CLIENT_CMD"
+        # Run selected client as the session command; fall back to bash on failure so errors are visible
+        tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLIENT_CMD || exec bash"
+        tmux set-environment -t "=$SESSION_NAME" WORKON_STARTED 1
+        tmux set-environment -t "=$SESSION_NAME" WORKON_CLIENT "$REQUESTED_CLIENT"
+        tmux set-environment -t "=$SESSION_NAME" WORKON_PROJECT "$PROJECT"
+        tmux set-environment -t "=$SESSION_NAME" WORKON_PROJECT_DIR "$PROJECT_DIR"
+        if [ "$REQUESTED_CLIENT" = "codex" ]; then
+            tmux set-environment -t "=$SESSION_NAME" WORKON_CODEX_SESSION_STATUS pending
+            tmux set-environment -t "=$SESSION_NAME" WORKON_CODEX_SESSION_ID ""
+        fi
+        mark_session_used "$SESSION_NAME"
+    }
+
+    restart_session() {
+        remote_debug_log "restart_session session_name=$SESSION_NAME reason=$1"
+        echo "$1"
+        tmux kill-session -t "=$SESSION_NAME"
+        start_session
+        tmux attach-session -t "=$SESSION_NAME"
+        exit 0
+    }
+
+    # Check if tmux session exists
+    if tmux has-session -t "=$SESSION_NAME" 2>/dev/null; then
+        echo "Attaching to existing tmux session: $SESSION_NAME"
+        remote_debug_log "attach_existing session_name=$SESSION_NAME"
+
+        ATTACHED_CLIENTS=$(attached_client_count "$SESSION_NAME")
+        if [[ "$ATTACHED_CLIENTS" =~ ^[0-9]+$ ]] && [ "$ATTACHED_CLIENTS" -gt 0 ]; then
+            echo "Session \"$SESSION_NAME\" has an attached tmux client; detaching it and reconnecting here."
+            remote_debug_log "detach_existing_clients session_name=$SESSION_NAME attached_clients=$ATTACHED_CLIENTS"
+            tmux detach-client -s "=$SESSION_NAME" 2>/dev/null || true
+        fi
+
+        # Require project metadata to match. This intentionally restarts older
+        # sessions that predate WORKON_PROJECT/WORKON_PROJECT_DIR tagging.
+        SESSION_PROJECT_ENV=$(tmux show-environment -t "=$SESSION_NAME" WORKON_PROJECT 2>/dev/null || true)
+        SESSION_PROJECT=${SESSION_PROJECT_ENV#WORKON_PROJECT=}
+        SESSION_PROJECT_DIR_ENV=$(tmux show-environment -t "=$SESSION_NAME" WORKON_PROJECT_DIR 2>/dev/null || true)
+        SESSION_PROJECT_DIR=${SESSION_PROJECT_DIR_ENV#WORKON_PROJECT_DIR=}
+        if [ -z "$SESSION_PROJECT_ENV" ] || [ -z "$SESSION_PROJECT_DIR_ENV" ] || [ "$SESSION_PROJECT" != "$PROJECT" ] || [ "$SESSION_PROJECT_DIR" != "$PROJECT_DIR" ]; then
+            restart_session "Session metadata mismatch/missing. Restarting session for project: $PROJECT"
+        fi
+
+        # If the existing session is pointed at a different project path,
+        # replace it so we do not attach to stale/misrouted state.
+        SESSION_PATH=$(tmux list-panes -t "=$SESSION_NAME" -F "#{pane_current_path}" 2>/dev/null | head -1)
+        if [ -z "$SESSION_PATH" ]; then
+            SESSION_PATH=$(tmux display-message -t "=$SESSION_NAME:0.0" -p "#{pane_current_path}" 2>/dev/null || true)
+        fi
+        if [ -n "$SESSION_PATH" ] && [ "$SESSION_PATH" != "$PROJECT_DIR" ] && [ "${SESSION_PATH#"$PROJECT_DIR/"}" = "$SESSION_PATH" ]; then
+            restart_session "Session path mismatch (existing: $SESSION_PATH, expected under: $PROJECT_DIR). Restarting session."
+        fi
+
+        # Restart if existing session was started with a different client.
+        SESSION_CLIENT_ENV=$(tmux show-environment -t "=$SESSION_NAME" WORKON_CLIENT 2>/dev/null || true)
+        SESSION_CLIENT=${SESSION_CLIENT_ENV#WORKON_CLIENT=}
+        if [ -n "$SESSION_CLIENT_ENV" ] && [ "$SESSION_CLIENT" != "$REQUESTED_CLIENT" ]; then
+            restart_session "Session client mismatch (existing: $SESSION_CLIENT, requested: $REQUESTED_CLIENT). Restarting session."
+        fi
+
+        # Check if we already sent the startup command (guards against race where
+        # client is mid-startup and pane_current_command still reports "bash")
+        ALREADY_STARTED=$(tmux show-environment -t "=$SESSION_NAME" WORKON_STARTED 2>/dev/null || true)
+        PANE_INFO=$(pane_runtime_info "$SESSION_NAME")
+        PANE_DEAD="${PANE_INFO%%|*}"
+        PANE_REST="${PANE_INFO#*|}"
+        PANE_CMD="${PANE_REST%%|*}"
+
+        if [ -z "$PANE_INFO" ] || [ "$PANE_DEAD" = "1" ]; then
+            restart_session "Session pane is unavailable. Restarting session."
+        fi
+
+        if [ -n "$ALREADY_STARTED" ] && is_shell_command "$PANE_CMD"; then
+            remote_debug_log "preserve_shell_after_startup session_name=$SESSION_NAME pane_cmd=$PANE_CMD"
+        fi
+
+        if [ "$REQUESTED_CLIENT" = "codex" ] && [ "$PANE_CMD" = "codex" ]; then
+            SESSION_CODEX_STATUS_ENV=$(tmux show-environment -t "=$SESSION_NAME" WORKON_CODEX_SESSION_STATUS 2>/dev/null || true)
+            SESSION_CODEX_STATUS=${SESSION_CODEX_STATUS_ENV#WORKON_CODEX_SESSION_STATUS=}
+            SESSION_CODEX_ID_ENV=$(tmux show-environment -t "=$SESSION_NAME" WORKON_CODEX_SESSION_ID 2>/dev/null || true)
+            SESSION_CODEX_ID=${SESSION_CODEX_ID_ENV#WORKON_CODEX_SESSION_ID=}
+
+            if [ -z "$SESSION_CODEX_STATUS_ENV" ]; then
+                restart_session "Codex session metadata missing. Restarting session."
+            fi
+
+            if [ "$SESSION_CODEX_STATUS" = "ready" ]; then
+                if ! valid_session_id "$SESSION_CODEX_ID" || ! session_id_matches_project_dir "$SESSION_CODEX_ID"; then
+                    restart_session "Codex session identity mismatch. Restarting session."
+                fi
+            fi
+        fi
+
+        if [ -z "$ALREADY_STARTED" ] && is_shell_command "$PANE_CMD"; then
+            remote_debug_log "send_keys_startup session_name=$SESSION_NAME pane_cmd=$PANE_CMD"
+            tmux set-environment -t "=$SESSION_NAME" WORKON_STARTED 1
+            tmux set-environment -t "=$SESSION_NAME" WORKON_CLIENT "$REQUESTED_CLIENT"
+            tmux send-keys -t "=$SESSION_NAME" "$CLIENT_CMD" Enter
+        fi
+
+        mark_session_used "$SESSION_NAME"
+        remote_debug_log "attach_complete session_name=$SESSION_NAME pane_cmd=$PANE_CMD"
+        tmux attach-session -t "=$SESSION_NAME"
+    else
+        remote_debug_log "no_existing_tmux_session session_name=$SESSION_NAME"
+        start_session
+        tmux attach-session -t "=$SESSION_NAME"
+    fi
+REMOTE_EOF
+)
+
+REMOTE_SCRIPT_ESCAPED=$(printf "%s" "$REMOTE_SCRIPT" | sed "s/'/'\\\\''/g")
+REMOTE_ARGS=$(printf '%q ' "$CLIENT" "$FOUND_PROJECT" "$SESSION_NUM")
+REMOTE_CMD="bash -c '$REMOTE_SCRIPT_ESCAPED' -- ${REMOTE_ARGS% }"
+
+ssh -t $SSH_INTERACTIVE_OPTS "$FOUND_HOST" "$REMOTE_CMD"
+
+# Drain any pending terminal escape sequences (iTerm2 responses to tmux queries)
+sleep 0.1
+read -r -t 0.5 -n 10000 2>/dev/null || true

@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Shared host discovery and SSH settings for the workon commands.
+
+WORKON_CACHE_DIR="${WORKON_CACHE_DIR:-$HOME/.cache/workon}"
+WORKON_HOSTS_CACHE="${WORKON_HOSTS_CACHE:-$WORKON_CACHE_DIR/hosts}"
+WORKON_CACHE_TTL="${WORKON_CACHE_TTL:-300}"
+
+workon_is_valid_hosts_output() {
+    local hosts_text="$1"
+
+    [ -n "$hosts_text" ] || return 1
+    printf '%s' "$hosts_text" | tr '\t\r\n' '   ' | grep -Eq '^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)* ?$'
+}
+
+workon_get_hosts() {
+    local now cache_age cache_mtime output
+
+    mkdir -p -m 700 "$WORKON_CACHE_DIR"
+    chmod 700 "$WORKON_CACHE_DIR"
+    now=$(date +%s)
+    cache_age=999999
+
+    if [ -f "$WORKON_HOSTS_CACHE" ]; then
+        cache_mtime=$(stat -f %m "$WORKON_HOSTS_CACHE" 2>/dev/null || stat -c %Y "$WORKON_HOSTS_CACHE" 2>/dev/null)
+        cache_age=$((now - cache_mtime))
+    fi
+
+    if [ "$cache_age" -lt "$WORKON_CACHE_TTL" ] && \
+       [ -s "$WORKON_HOSTS_CACHE" ] && \
+       workon_is_valid_hosts_output "$(cat "$WORKON_HOSTS_CACHE")"; then
+        cat "$WORKON_HOSTS_CACHE"
+        return 0
+    fi
+
+    if output=$(aws ec2 describe-instances \
+        --filters "Name=tag:Workon,Values=true" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].Tags[?Key==`Name`].Value | []' \
+        --output text 2>&1); then
+        if ! workon_is_valid_hosts_output "$output"; then
+            echo "Error: AWS returned an invalid or empty host list." >&2
+            return 1
+        fi
+        (umask 077; printf '%s\n' "$output" > "$WORKON_HOSTS_CACHE")
+        printf '%s\n' "$output"
+        return 0
+    fi
+
+    if [ -f "$WORKON_HOSTS_CACHE" ] && \
+       workon_is_valid_hosts_output "$(cat "$WORKON_HOSTS_CACHE")"; then
+        cat "$WORKON_HOSTS_CACHE"
+        return 0
+    fi
+
+    echo "Error querying AWS EC2: $output" >&2
+    return 1
+}
+
+workon_configure_ssh() {
+    local connect_timeout server_alive_interval server_alive_count_max
+
+    connect_timeout="${WORKON_CONNECT_TIMEOUT:-5}"
+    server_alive_interval="${WORKON_SERVER_ALIVE_INTERVAL:-30}"
+    server_alive_count_max="${WORKON_SERVER_ALIVE_COUNT_MAX:-20}"
+
+    case "$connect_timeout:$server_alive_interval:$server_alive_count_max" in
+        *[!0-9:]*|:*|*::*|*:) echo "Error: SSH timeout settings must be non-negative integers." >&2; return 1 ;;
+    esac
+
+    # Never reuse a persistent master: it may retain a connection tied to a
+    # previous network after switching between Wi-Fi and a hotspot.
+    WORKON_SSH_OPTS="-o ControlMaster=no -o ControlPath=none -o ConnectTimeout=$connect_timeout -o ServerAliveInterval=$server_alive_interval -o ServerAliveCountMax=$server_alive_count_max"
+}
